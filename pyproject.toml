@@ -1,0 +1,28 @@
+[project]
+name = "gripper-mask"
+version = "0.1.0"
+description = "Generate gripper masks for SO-101 wrist-cam images via HSV color thresholding"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python-headless>=4.10",
+    "numpy>=2",
+]
+
+[project.scripts]
+gripper-mask = "gripper_mask.cli:entrypoint"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gripper_mask"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
