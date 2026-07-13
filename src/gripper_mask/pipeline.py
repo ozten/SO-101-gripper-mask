@@ -1,7 +1,12 @@
-"""Per-image mask pipeline: threshold, morphology, component selection, rendering.
+"""Per-image mask pipeline: threshold, morphology, chroma-core selection, rendering.
 
 Mask convention: single-channel uint8, 0 = gripper (masked area), 255 = keep.
 Resize masks with nearest-neighbor only; bilinear creates gray boundary values.
+
+Selection is biased to never miss gripper pixels: every component that passes the
+chroma-core gate is kept (over-masking a vivid orange scene object is acceptable;
+losing a finger is not), the final mask is grown outward, and enclosed holes are
+filled so the mask is always a set of solid regions.
 """
 
 from __future__ import annotations
@@ -10,17 +15,6 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-
-# Components whose lowest point reaches into this bottom band count as edge-touching.
-BOTTOM_EDGE_FRACTION = 0.10
-# A second component must be color-pure enough to be kept at all — via either the
-# area-ratio or bottom-edge path. Without the gate, a large marginal background
-# region (the wood panel is bigger than the gripper and touches the bottom edge)
-# re-qualifies as component 2 through both paths. Relative floor guards blurry
-# frames where every score is low; the absolute floor guards the warm-frame case
-# where the panel scores ~0.15 while the gripper scores ~0.32.
-SECOND_CORE_FLOOR = 0.5
-SECOND_CORE_ABS = 0.25
 
 
 @dataclass
@@ -32,12 +26,11 @@ class PipelineConfig:
     close_kernel: int = 5
     close_iters: int = 2
     dilate: int = 3
-    second_ratio: float = 0.15
     min_area: float = 0.005  # fraction of frame pixels
     roi: tuple[int, int, int, int] | None = None  # x0, y0, x1, y1 (pixels)
-    edge_prior: bool = True
-    core_sat: int = 165  # core-score saturation floor (gripper ~200, corks ~140)
-    core_val: int = 175  # core-score value floor (gripper bright plastic, wood ~145-165)
+    core_chroma: int = 60  # Lab chroma floor defining "vividly orange" core pixels
+    core_frac: float = 0.35  # component kept when this fraction of it is core
+    grow: int = 5  # grow the final mask outward by this many pixels
 
 
 def rgb_to_hsv(color: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -77,36 +70,63 @@ def close_and_dilate(mask: np.ndarray, kernel: int, iters: int, dilate_px: int) 
     return mask
 
 
-def _core_score(component_mask: np.ndarray, hsv: np.ndarray, hue: int, cfg: PipelineConfig) -> float:
-    """Fraction of the component's pixels in the high-purity core window.
+def chroma_map(bgr: np.ndarray) -> np.ndarray:
+    """Lab chroma per pixel (OpenCV 8-bit Lab scale, a/b offset by 128).
 
-    Measured on the reference dataset, hue alone does NOT separate the gripper from
-    warm backgrounds (corks and wood sit at the same hue); saturation separates the
-    corks (~140 vs ~200) and value separates the wood (~145-165 vs bright plastic).
-    The core window is the outer hue window with raised S/V floors; gripper
-    components score 0.3-0.85, corks and wood score 0.0-0.17.
+    Measured on the reference dataset, chroma is what actually separates the
+    vibrant-orange gripper from warm backgrounds sharing its hue: gripper
+    components sit at chroma 59-83 (49-88% of pixels >= 60), while the warm wall
+    and wood measure 46-50 (0-23% >= 60) and corks 23-43 (0%). HSV saturation
+    cannot make this cut — the wall is MORE HSV-saturated than the gripper in
+    some frames.
     """
-    core = threshold(
-        hsv,
-        hue,
-        cfg.hue_tol,
-        max(cfg.sat_min, cfg.core_sat),
-        max(cfg.val_min, cfg.core_val),
-    )
-    comp_px = int(np.count_nonzero(component_mask))
-    if comp_px == 0:
-        return 0.0
-    return int(np.count_nonzero(core & component_mask)) / comp_px
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab).astype(np.int16)
+    a = lab[..., 1] - 128
+    b = lab[..., 2] - 128
+    return np.hypot(a, b)
 
 
-def select_components(
-    binary: np.ndarray, hsv: np.ndarray, base_hue: int, cfg: PipelineConfig
-) -> list[np.ndarray]:
-    """Pick the 1-2 contours to render, per KTD-4.
+def _grow_and_fill(keep: np.ndarray, grow: int) -> np.ndarray:
+    """Dilate the kept region outward and fill every enclosed hole.
 
-    ROI restriction -> min-area floor -> rank by banded core score (bottom-edge
-    contact secondary, area tertiary) -> keep top; keep 2nd on area ratio or
-    bottom-edge fallback, gated on color purity.
+    Downstream gaussian-splat training corrupts on pinholes inside the gripper
+    region, so the mask must be solid: grow closes boundary notches and swallows
+    speck-sized misses; the flood fill turns any remaining enclosed white island
+    black. Growing more than the gripper is acceptable; missing gripper is not.
+    """
+    if grow > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
+        keep = cv2.dilate(keep, k)
+    # Flood the background from the border; unreached zero-pixels are enclosed
+    # holes inside kept regions.
+    h, w = keep.shape
+    flood = keep.copy()
+    ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 255)
+    for x, y in ((w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+        if flood[y, x] == 0:
+            cv2.floodFill(flood, ff_mask, (x, y), 255)
+    holes = flood == 0
+    keep = keep.copy()
+    keep[holes] = 255
+    return keep
+
+
+def select_components(binary: np.ndarray, chroma: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
+    """Chroma-core gated selection; returns the kept region as a binary (255 = gripper).
+
+    Every thresholded component above the min-area floor is judged by its core
+    fraction — the share of its pixels that are vividly chromatic:
+
+    - core fraction >= `core_frac`: the component is gripper; keep it whole
+      (including its blur halo).
+    - below the gate but containing gripper-sized vivid sub-regions: the component
+      is a merge of gripper and background (a finger visually abutting the warm
+      wall); cut out and keep the vivid sub-regions, drop the rest.
+    - otherwise: background look-alike (cork, wood, wall); drop it.
+
+    All passing components are kept — a motion-blurred finger can fragment into
+    several blobs, and dropping any of them leaks gripper into training data.
     """
     h, w = binary.shape
     if cfg.roi is not None:
@@ -117,59 +137,45 @@ def select_components(
         ]
         binary = clipped
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    core = ((chroma >= cfg.core_chroma) & (binary > 0)).astype(np.uint8) * 255
     min_area_px = cfg.min_area * h * w
-    bottom_band = h * (1.0 - BOTTOM_EDGE_FRACTION)
 
-    candidates = []
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    keep = np.zeros_like(binary)
     for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area_px:
+        if cv2.contourArea(c) < min_area_px:
             continue
         comp = np.zeros_like(binary)
         cv2.drawContours(comp, [c], -1, 255, thickness=cv2.FILLED)
-        score = _core_score(comp, hsv, base_hue, cfg)
-        touches_bottom = bool(c[:, :, 1].max() >= bottom_band)
-        candidates.append((c, area, score, touches_bottom))
-
-    if not candidates:
-        return []
-
-    edge_key = (lambda t: t[3]) if cfg.edge_prior else (lambda t: False)
-    # Banded score (1 decimal) ranks by color purity without letting a 0.01 score
-    # difference override a large area difference between two genuine fingers.
-    candidates.sort(key=lambda t: (round(t[2], 1), edge_key(t), t[1]), reverse=True)
-
-    kept = [candidates[0]]
-    if len(candidates) > 1:
-        primary = candidates[0]
-        second = candidates[1]
-        significant = second[1] >= cfg.second_ratio * primary[1]
-        edge_rescue = cfg.edge_prior and second[3]
-        pure_enough = second[2] >= max(SECOND_CORE_FLOOR * primary[2], SECOND_CORE_ABS)
-        if (significant or edge_rescue) and pure_enough:
-            kept.append(second)
-    return [c for c, _, _, _ in kept]
-
-
-def render_mask(shape: tuple[int, int], contours: list[np.ndarray]) -> np.ndarray:
-    """White (255 = keep) canvas with kept components drawn as filled black (0) regions."""
-    mask = np.full(shape, 255, dtype=np.uint8)
-    if contours:
-        cv2.drawContours(mask, contours, -1, 0, thickness=cv2.FILLED)
-    return mask
+        comp_core = core & comp
+        comp_px = int(np.count_nonzero(comp))
+        frac = int(np.count_nonzero(comp_core)) / comp_px
+        if frac >= cfg.core_frac:
+            keep |= comp
+        elif frac > 0:
+            sub_contours, _ = cv2.findContours(
+                comp_core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for sub in sub_contours:
+                if cv2.contourArea(sub) >= min_area_px:
+                    cv2.drawContours(keep, [sub], -1, 255, thickness=cv2.FILLED)
+    return keep
 
 
 def process_image(bgr: np.ndarray, cfg: PipelineConfig) -> tuple[np.ndarray, bool]:
     """Run the full pipeline on one BGR image.
 
-    Returns (mask, empty) — mask is single-channel at source resolution;
-    empty is True when no component survived (mask is all-white).
+    Returns (mask, empty) — mask is single-channel at source resolution
+    (0 = gripper, 255 = keep); empty is True when nothing was kept.
     """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     base_hue, _, _ = rgb_to_hsv(cfg.color)
     binary = threshold(hsv, base_hue, cfg.hue_tol, cfg.sat_min, cfg.val_min)
     binary = close_and_dilate(binary, cfg.close_kernel, cfg.close_iters, cfg.dilate)
-    kept = select_components(binary, hsv, base_hue, cfg)
-    mask = render_mask(binary.shape, kept)
-    return mask, not kept
+    keep = select_components(binary, chroma_map(bgr), cfg)
+    empty = not np.any(keep)
+    if not empty:
+        keep = _grow_and_fill(keep, cfg.grow)
+    mask = np.full(binary.shape, 255, dtype=np.uint8)
+    mask[keep > 0] = 0
+    return mask, empty

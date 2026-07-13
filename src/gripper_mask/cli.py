@@ -60,12 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     tuning.add_argument("--close-kernel", type=int, default=5, help="morphological close kernel size (default 5)")
     tuning.add_argument("--close-iters", type=int, default=2, help="morphological close iterations (default 2)")
     tuning.add_argument("--dilate", type=int, default=3, help="dilation radius in pixels (default 3)")
-    tuning.add_argument("--second-ratio", type=float, default=0.15, help="keep 2nd component when its area >= ratio x largest (default 0.15)")
     tuning.add_argument("--min-area", type=float, default=0.005, help="minimum component area as fraction of frame pixels (default 0.005)")
-    tuning.add_argument("--core-sat", type=int, default=165, help="core-score saturation floor for component ranking (default 165)")
-    tuning.add_argument("--core-val", type=int, default=175, help="core-score value floor for component ranking (default 175)")
+    tuning.add_argument("--core-chroma", type=int, default=60, help="Lab chroma floor defining vivid 'core' pixels (default 60)")
+    tuning.add_argument("--core-frac", type=float, default=0.35, help="keep a component when this fraction of it is core (default 0.35)")
+    tuning.add_argument("--grow", type=int, default=5, help="grow the final mask outward by N pixels (default 5)")
     tuning.add_argument("--roi", type=roi_box, default=None, help="restrict component search to 'x0,y0,x1,y1' pixels (default: full frame)")
-    tuning.add_argument("--no-edge-prior", action="store_true", help="disable the bottom-edge spatial preference")
     mask.add_argument("--skip-existing", action="store_true", help="skip images whose mask already exists (default: overwrite)")
 
     qa = sub.add_parser("qa", help="build and serve the QA gallery for generated masks")
@@ -110,12 +109,11 @@ def cmd_mask(args: argparse.Namespace) -> int:
         close_kernel=args.close_kernel,
         close_iters=args.close_iters,
         dilate=args.dilate,
-        second_ratio=args.second_ratio,
         min_area=args.min_area,
         roi=args.roi,
-        edge_prior=not args.no_edge_prior,
-        core_sat=args.core_sat,
-        core_val=args.core_val,
+        core_chroma=args.core_chroma,
+        core_frac=args.core_frac,
+        grow=args.grow,
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)

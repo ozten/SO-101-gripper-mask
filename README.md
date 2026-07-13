@@ -32,11 +32,15 @@ A one-line summary prints at the end (`processed N, empty N, skipped N`). Frames
 | 1 | ran, but some files were skipped (unreadable) or produced empty masks |
 | 2 | usage or environment error (bad flag, missing directory, basename collision) |
 
+### How selection works
+
+Thresholding happens in HSV (hue window + saturation/value floors), but component *selection* happens in **Lab chroma** — the measure of color vibrancy. The gripper is vibrant orange (chroma 59–83 on the reference capture); the warm wall, wood, and corks share its hue but are dull (chroma 23–50). Every thresholded component is kept when at least `--core-frac` of its pixels are vivid (chroma ≥ `--core-chroma`); a component that fails the gate but contains gripper-sized vivid sub-regions (a finger visually touching the wall merges into one blob with it) has those sub-regions cut out and kept. All passing components are kept — a motion-blurred finger can fragment into several blobs, and the tool is biased to never miss gripper pixels.
+
+The final mask is grown outward by `--grow` pixels (default 5) and every enclosed hole is filled, so masks are always solid regions — no pinholes to corrupt gaussian-splat training. Over-masking slightly beyond the gripper is by design.
+
 ### Tuning flags
 
-All pipeline parameters are flags with defaults calibrated against the shakedown reference capture: `--hue-tol 8`, `--sat-min 100`, `--val-min 60`, `--close-kernel 5`, `--close-iters 2`, `--dilate 3`, `--second-ratio 0.15`, `--min-area 0.005`, `--core-sat 165`, `--core-val 175`, `--roi x0,y0,x1,y1`, `--no-edge-prior`. See `uv run gripper-mask mask --help`.
-
-The `--core-sat` / `--core-val` pair defines the "core score" used to rank candidate components: the fraction of a component's pixels that are both strongly saturated and bright. This is what keeps wine corks (same hue as the gripper, low saturation) and warm wood surfaces (same hue, low brightness) out of the mask.
+All pipeline parameters are flags with defaults calibrated against the shakedown reference capture: `--hue-tol 8`, `--sat-min 100`, `--val-min 60`, `--close-kernel 5`, `--close-iters 2`, `--dilate 3`, `--min-area 0.005`, `--core-chroma 60`, `--core-frac 0.35`, `--grow 5`, `--roi x0,y0,x1,y1`. See `uv run gripper-mask mask --help`.
 
 ## QA gallery
 
@@ -52,4 +56,4 @@ Builds a self-contained static gallery in `<masks_dir>/qa/` (regenerated from sc
 
 ## Known limitation
 
-Classical color thresholding cannot fully separate the gripper from **bright, warm wood surfaces** — under this camera's white balance they overlap the gripper's HSV envelope. On transitional frames where the arm swings toward the desk edge or wood panel, a mask may include part of the panel (over-mask) or lose a finger that visually merges with it. In the 187-frame reference capture this affects roughly a dozen frames; typical over-the-workspace frames mask cleanly. Use the QA gallery to flag and exclude such frames, or re-run with `--sat-min 165` for those captures and compare.
+Scene objects that are as vividly orange as the gripper itself (chroma near or above `--core-chroma`) will be masked along with it — the tool deliberately prefers over-masking to ever missing gripper pixels. Dull warm surfaces (wood, walls, corks) are excluded by the chroma gate even when they share the gripper's hue. Use the QA gallery to review; raise `--core-frac` or `--core-chroma` if a vivid object keeps sneaking in.

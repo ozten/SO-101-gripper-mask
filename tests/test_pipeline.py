@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from gripper_mask.pipeline import PipelineConfig, process_image, rgb_to_hsv
+from gripper_mask.pipeline import PipelineConfig, chroma_map, process_image, rgb_to_hsv
 
 W, H = 320, 240  # min-area floor at defaults: 0.5% = 384 px
 
@@ -19,8 +19,24 @@ def rgb_of(bgr):
     return (bgr[2], bgr[1], bgr[0])
 
 
-ORANGE_BGR = hsv_bgr(12)  # gripper stand-in, hue 12
+ORANGE_BGR = hsv_bgr(12)  # gripper stand-in, hue 12, vivid (Lab chroma well above 60)
 ORANGE_RGB = rgb_of(ORANGE_BGR)
+# Dull warm background stand-ins: same hue family, chroma below the core floor.
+WALL_BGR = hsv_bgr(12, 150, 170)
+CORK_BGR = hsv_bgr(12, 140, 200)
+
+
+def test_standin_chromas_bracket_the_core_floor():
+    # Guard the test fixtures themselves: the "gripper" color must be vivid and
+    # the wall/cork stand-ins dull, mirroring the measured dataset separation.
+    def chroma_of(bgr):
+        img = np.zeros((4, 4, 3), dtype=np.uint8)
+        img[:] = bgr
+        return float(np.median(chroma_map(img)))
+
+    assert chroma_of(ORANGE_BGR) >= 80
+    assert chroma_of(WALL_BGR) < 55
+    assert chroma_of(CORK_BGR) < 55
 
 
 def canvas():
@@ -39,7 +55,7 @@ def cfg(**overrides):
 
 def test_single_rectangle_masked_shape_and_polarity():
     img = canvas()
-    rect(img, 100, 180, 180, H, ORANGE_BGR)  # touches bottom
+    rect(img, 100, 180, 180, H, ORANGE_BGR)
     mask, empty = process_image(img, cfg())
     assert not empty
     assert mask.ndim == 2 and mask.dtype == np.uint8
@@ -52,38 +68,23 @@ def test_single_rectangle_masked_shape_and_polarity():
 def test_two_blobs_second_at_forty_percent_kept():
     # Covers AE1: 2nd blob at ~40% of the largest's area -> both masked.
     img = canvas()
-    rect(img, 40, 170, 110, H, ORANGE_BGR)  # 70x70
-    rect(img, 220, 196, 264, H, ORANGE_BGR)  # 44x44 ~ 40%
+    rect(img, 40, 170, 110, H, ORANGE_BGR)
+    rect(img, 220, 196, 264, H, ORANGE_BGR)
     mask, _ = process_image(img, cfg())
     assert mask[210, 75] == 0
     assert mask[220, 242] == 0
 
 
-def test_second_below_ratio_not_touching_bottom_excluded():
+def test_all_vivid_fragments_kept():
+    # A blurred finger can fragment into 3+ blobs; none may be dropped.
     img = canvas()
-    rect(img, 40, 170, 140, H, ORANGE_BGR)  # 100x70 = 7000 px
-    rect(img, 240, 60, 266, 86, ORANGE_BGR)  # 26x26 = 676 px < 15%, floats mid-frame
+    rect(img, 30, 170, 100, H, ORANGE_BGR)
+    rect(img, 140, 60, 180, 100, ORANGE_BGR)  # small, floating mid-frame
+    rect(img, 230, 200, 280, H, ORANGE_BGR)
     mask, _ = process_image(img, cfg())
-    assert mask[210, 90] == 0
-    assert mask[73, 253] == 255
-
-
-def test_second_below_ratio_touching_bottom_kept():
-    img = canvas()
-    rect(img, 40, 170, 140, H, ORANGE_BGR)
-    rect(img, 240, 214, 266, H, ORANGE_BGR)  # small but real: touches bottom edge
-    mask, _ = process_image(img, cfg())
-    assert mask[210, 90] == 0
-    assert mask[230, 253] == 0
-
-
-def test_no_edge_prior_disables_bottom_fallback():
-    img = canvas()
-    rect(img, 40, 170, 140, H, ORANGE_BGR)
-    rect(img, 240, 214, 266, H, ORANGE_BGR)
-    mask, _ = process_image(img, cfg(edge_prior=False))
-    assert mask[210, 90] == 0
-    assert mask[230, 253] == 255  # fallback off: below-ratio blob dropped
+    assert mask[210, 60] == 0
+    assert mask[80, 160] == 0
+    assert mask[220, 255] == 0
 
 
 def test_hue_wraparound_both_sides_detected():
@@ -97,34 +98,70 @@ def test_hue_wraparound_both_sides_detected():
     assert mask[210, 240] == 0
 
 
-def test_wood_panel_loses_to_core_score_despite_size_and_bottom_edge():
-    # Mirrors frame 00000840: big warm panel ALSO touching the bottom edge.
-    # Panel hue 19 passes the outer threshold but its value (170) sits below the
-    # core-score value floor, so it scores ~0 while the gripper scores ~1.
+def test_dull_wall_excluded_despite_size():
+    # Mirrors frames 00000835/00000788: a huge warm wall shares the gripper's hue
+    # but is dull (low Lab chroma) -> dropped by the core-fraction gate.
     img = canvas()
-    rect(img, 0, 60, 160, H, hsv_bgr(19, 180, 170))  # huge, bottom-touching panel
-    rect(img, 230, 190, 290, H, ORANGE_BGR)  # small true gripper
+    rect(img, 0, 0, 180, H, WALL_BGR)  # wall fills the left half, touches bottom
+    rect(img, 230, 190, 290, H, ORANGE_BGR)
     mask, _ = process_image(img, cfg())
     assert mask[220, 260] == 0  # gripper masked
-    assert mask[150, 80] == 255  # panel NOT masked (neither primary nor rescued 2nd)
+    assert mask[120, 90] == 255  # wall untouched
 
 
-def test_cork_like_blob_excluded_by_saturation():
-    # Corks share the gripper's hue but sit at saturation ~140 (< core floor 165).
+def test_finger_merged_with_wall_is_cut_out():
+    # Mirrors frame 00000319: a vivid finger visually abuts the dull wall, so
+    # thresholding merges them into one component. The vivid sub-region must be
+    # cut out and kept rather than dropped with the wall.
     img = canvas()
-    rect(img, 40, 120, 160, H, hsv_bgr(12, 140, 220))  # big bottom-touching "cork"
-    rect(img, 230, 190, 290, H, ORANGE_BGR)  # smaller true gripper
+    rect(img, 0, 0, 165, H, WALL_BGR)
+    rect(img, 155, 150, 215, H, ORANGE_BGR)  # finger overlapping the wall's edge
+    mask, empty = process_image(img, cfg())
+    assert not empty
+    assert mask[200, 185] == 0  # finger masked despite the merge
+    assert mask[120, 60] == 255  # wall body still excluded
+
+
+def test_cork_like_blob_excluded():
+    img = canvas()
+    rect(img, 40, 120, 160, H, CORK_BGR)  # big bottom-touching "cork"
+    rect(img, 230, 190, 290, H, ORANGE_BGR)
     mask, _ = process_image(img, cfg())
-    assert mask[220, 260] == 0  # gripper masked
-    assert mask[200, 100] == 255  # cork-like blob excluded despite size + bottom edge
+    assert mask[220, 260] == 0
+    assert mask[200, 100] == 255
 
 
 def test_interior_hole_filled():
     img = canvas()
-    rect(img, 100, 150, 220, H, ORANGE_BGR)
-    rect(img, 140, 180, 180, 210, (40, 40, 40))  # hole (screw/shadow)
-    mask, _ = process_image(img, cfg(dilate=0, close_kernel=1, close_iters=0))
-    assert mask[195, 160] == 0  # hole interior masked by filled contour
+    rect(img, 100, 120, 220, H, ORANGE_BGR)
+    rect(img, 140, 160, 180, 200, (40, 40, 40))  # hole (screw/shadow)
+    mask, _ = process_image(img, cfg(dilate=0, close_kernel=1, close_iters=0, grow=0))
+    assert mask[180, 160] == 0  # hole interior masked even with grow disabled
+
+
+def test_speck_holes_filled_and_mask_solid():
+    # The gaussian-splat guarantee: scatter non-orange specks through the blob;
+    # the final mask must be one solid region with zero enclosed white pixels.
+    img = canvas()
+    rect(img, 80, 100, 240, H, ORANGE_BGR)
+    rng = np.random.default_rng(7)
+    for _ in range(40):
+        x = int(rng.integers(90, 230))
+        y = int(rng.integers(110, 230))
+        rect(img, x, y, x + 3, y + 3, (40, 40, 40))
+    mask, _ = process_image(img, cfg())
+    region = mask[110:230, 95:225]
+    assert np.all(region == 0)  # no pinholes anywhere inside the blob
+
+
+def test_grow_expands_mask_boundary():
+    img = canvas()
+    rect(img, 100, 100, 200, 180, ORANGE_BGR)
+    tight, _ = process_image(img, cfg(grow=0, dilate=0, close_kernel=1, close_iters=0))
+    grown, _ = process_image(img, cfg(grow=5, dilate=0, close_kernel=1, close_iters=0))
+    assert tight[90, 150] == 255  # 10 px above the blob: outside tight mask
+    assert grown[96, 150] == 0  # within 5 px of the blob edge: inside grown mask
+    assert grown[80, 150] == 255  # well beyond the growth: still keep
 
 
 def test_below_min_area_gives_empty_all_white():
@@ -143,14 +180,16 @@ def test_plain_frame_gives_empty_all_white():
 
 def test_roi_restricts_selection():
     img = canvas()
-    rect(img, 20, 170, 100, H, ORANGE_BGR)  # outside ROI, bigger
+    rect(img, 20, 170, 100, H, ORANGE_BGR)  # outside ROI
     rect(img, 220, 190, 270, H, ORANGE_BGR)  # inside ROI
     mask, _ = process_image(img, cfg(roi=(160, 0, W, H)))
     assert mask[220, 245] == 0
     assert mask[210, 60] == 255
 
 
-@pytest.mark.parametrize("hue,expected", [(12, [(4, 20)]), (3, [(0, 11), (175, 179)]), (176, [(0, 4), (168, 179)])])
+@pytest.mark.parametrize(
+    "hue,expected", [(12, [(4, 20)]), (3, [(0, 11), (175, 179)]), (176, [(0, 4), (168, 179)])]
+)
 def test_hue_windows_wrap_modulo_180(hue, expected):
     from gripper_mask.pipeline import hue_windows
 
